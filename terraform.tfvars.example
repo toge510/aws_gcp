@@ -1,0 +1,17 @@
+# cp terraform.tfvars.example terraform.tfvars して編集する
+
+gcp_project_id = "my-gcp-project"
+gcp_region     = "asia-northeast1"
+aws_region     = "ap-northeast-1"
+
+name_prefix = "aws-to-cloudsql"
+
+# MySQL のユーザー名は "<sa_account_id>@<gcp_project_id>.iam" となり
+# 32 文字以内に収める必要がある
+sa_account_id = "sql-client"
+
+db_tier = "db-f1-micro"
+db_name = "appdb"
+
+# 本番では true に
+deletion_protection = false

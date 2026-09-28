@@ -1,0 +1,35 @@
+# --- 機密情報を含みうるファイル（絶対にコミットしない） ---
+# state には random_password の生成値や Cloud SQL の接続情報が平文で入る
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+crash.*.log
+
+# 実際のプロジェクト ID などを含む変数ファイル（.example のみコミット）
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# サービスアカウントキー / AWS 認証情報の類（本構成では使わないが誤コミット防止）
+*.json.key
+*-key.json
+credentials.json
+service-account*.json
+.envrc
+.env
+.env.*
+
+# --- Terraform の作業ディレクトリ ---
+.terraform/
+.terraform.tfstate.lock.info
+
+# terraform.lock.hcl はプロバイダのバージョン固定のためコミットする
+# （.gitignore しないこと）
+
+# --- その他 ---
+*.plan
+*.tfplan
+__pycache__/
+*.pyc
+.DS_Store
