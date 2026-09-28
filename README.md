@@ -7,36 +7,67 @@ AWS ECS Fargate 上のコンテナから Google Cloud の Cloud SQL for MySQL �
 - 接続: Cloud SQL Auth Proxy をサイドカーとして同一タスク内で実行
 - DB 認証: IAM データベース認証（`--auto-iam-authn`）によりパスワードも不要
 
+> 📖 **なぜこの構成になっているのか** — Fargate では公式ドキュメントどおりの設定では
+> Workload Identity 連携が動きません。その理由と解決策の比較を図つきで解説しています:
+> **[docs/fargate-workload-identity.md](docs/fargate-workload-identity.md)**
+
 ## 構成
 
-```
-AWS (ap-northeast-1)                           Google Cloud
-┌──────────────────────────────────────────┐
-│ VPC                                      │
-│  private subnet                          │
-│  ┌────────────────────────────────────┐  │
-│  │ ECS Fargate task (awsvpc)          │  │
-│  │                                    │  │
-│  │  ① config-init  (設定を配置)       │  │
-│  │  ② imds-shim    127.0.0.1:8169 ────┼──┼─→ (ECS 認証情報 169.254.170.2)
-│  │  ③ cloud-sql-proxy 127.0.0.1:3306  │  │
-│  │        │         └─────────────────┼──┼─→ STS / IAM Credentials API
-│  │  ④ app ─┘ mysql -u <SA>@<proj>.iam │  │        ↓ サービスアカウント借用
-│  └────────────────────────────────────┘  │   ┌──────────────────────┐
-│                   │ NAT Gateway (EIP)  ──┼───┼─→ Cloud SQL for MySQL │
-└───────────────────┼──────────────────────┘   │  (承認済みネットワーク │
-                    └──────────────────────────┼─  = NAT の EIP)       │
-                                               └──────────────────────┘
+```mermaid
+flowchart LR
+    subgraph AWS["AWS"]
+        direction TB
+        subgraph TASK["ECS Fargate タスク（private subnet / awsvpc）"]
+            direction TB
+            INIT["① config-init<br/>設定を配置<br/>して終了"]
+            SHIM["② imds-shim<br/>127.0.0.1:8169"]
+            PROXY["③ cloud-sql-proxy<br/>127.0.0.1:3306"]
+            APP["④ app<br/>mysql クライアント"]
+
+            INIT -.->|"配置後に起動"| SHIM
+            APP -->|"MySQL"| PROXY
+            PROXY -->|"AWS 認証情報"| SHIM
+        end
+        NAT["NAT Gateway<br/>(固定 EIP)"]
+        ECSEP["ECS 認証情報エンドポイント<br/>169.254.170.2"]
+    end
+
+    subgraph GCP["Google Cloud"]
+        direction TB
+        STS["STS /<br/>IAM Credentials API"]
+        SA["サービスアカウント<br/>(キーなし)"]
+        SQL["Cloud SQL for MySQL<br/>承認済み NW = NAT の EIP"]
+        STS -.->|借用| SA
+    end
+
+    SHIM -->|毎回取得| ECSEP
+    PROXY -->|トークン交換| NAT
+    NAT --> STS
+    PROXY -->|TLS 接続| NAT
+    NAT --> SQL
+
+    style SHIM fill:#e6f3ff,stroke:#0b72d0,stroke-width:2px
+    style SQL fill:#e6ffe6,stroke:#1a8f1a
 ```
 
 ### 認証の流れ（キーが登場しない理由）
 
-1. ECS タスクはタスクロールの一時認証情報を持つ（AWS が自動発行・自動更新）
-2. その認証情報で `sts:GetCallerIdentity` リクエストに SigV4 署名する
-3. 署名済みリクエストを GCP STS に提示 → フェデレーショントークンを取得
-4. そのトークンで GCP サービスアカウントを借用 → アクセストークンを取得
-5. Cloud SQL Auth Proxy がそのトークンで接続を確立し、IAM DB 認証の
-   パスワードとしても使用する
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as ECS タスク
+    participant GS as GCP STS
+    participant AS as AWS STS
+    participant SQL as Cloud SQL
+
+    T->>T: ① タスクロールの一時認証情報を取得<br/>(AWS が自動発行・自動ローテーション)
+    T->>T: ② GetCallerIdentity に SigV4 署名
+    T->>GS: ③ 署名済みリクエストを提示
+    GS->>AS: 代理で実行し呼び出し元 ARN を確認
+    AS-->>GS: arn:aws:sts::…:assumed-role/…
+    GS-->>T: ④ サービスアカウント借用 → アクセストークン
+    T->>SQL: ⑤ Auth Proxy が接続を確立<br/>(トークンを IAM DB 認証のパスワードにも使う)
+```
 
 いずれの段階でも長期のシークレットは保存されません。
 
@@ -55,6 +86,7 @@ Workload Identity 連携の AWS 認証情報を **EC2 IMDS (`169.254.169.254`) �
 `AWS_ACCESS_KEY_ID` などの環境変数へ展開する方法です。しかし
 **ECS タスクロールの認証情報は約 6 時間で失効し、環境変数は更新されない**ため、
 常駐サービスでは失効後に STS トークン交換が失敗します。
+しかも**デプロイ直後のテストでは成功してしまう**のが厄介な点です。
 
 そこで本構成では `files/imds_shim.py`（**EC2 IMDS 互換シム**）をサイドカーで動かし、
 `127.0.0.1:8169` に IMDS 互換のエンドポイントを公開します。問い合わせのたびに
@@ -67,6 +99,9 @@ URL をこのシムに向けるだけです。
 ```bash
 python3 files/test_imds_shim.py
 ```
+
+> 詳しい背景、他の解決策（カスタム supplier 方式など）との比較、選定フローチャートは
+> **[docs/fargate-workload-identity.md](docs/fargate-workload-identity.md)** を参照してください。
 
 ## 事前準備
 
@@ -142,6 +177,7 @@ FLUSH PRIVILEGES;
 | `aws_ecs.tf` | ECS クラスタ、タスク定義（4 コンテナ）、サービス |
 | `files/imds_shim.py` | EC2 IMDS 互換シム |
 | `files/test_imds_shim.py` | シムの単体テスト |
+| `docs/fargate-workload-identity.md` | **設計の背景解説**（図つき・解決策の比較） |
 
 ## セキュリティ上のポイント
 
@@ -191,7 +227,9 @@ Auth Proxy に渡してください（`credential_source` は無視されます�
 
 ## 参考
 
+- **[docs/fargate-workload-identity.md](docs/fargate-workload-identity.md)** — 設計の背景と解決策の比較（図つき）
 - [Configure Workload Identity Federation with AWS or Azure](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds)
 - [Cloud SQL: IAM データベース認証](https://docs.cloud.google.com/sql/docs/mysql/iam-authentication)
+- [Fargate で Workload Identity を使うベストな方法 | DevelopersIO](https://dev.classmethod.jp/articles/best-way-to-use-fargate-workload-identity/)
 - [google-cloud-go#13479: auth: support AWS ECS default credentials detection](https://github.com/googleapis/google-cloud-go/issues/13479)
 - [google-auth-library-java#1374: Support Workload Identity Federation on AWS ECS/Fargate](https://github.com/googleapis/google-auth-library-java/pull/1374)
