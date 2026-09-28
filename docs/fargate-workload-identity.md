@@ -7,9 +7,10 @@ AWS ECS Fargate から Google Cloud のリソースへ、**サービスアカウ
 このドキュメントでは、
 
 1. そもそも Workload Identity 連携がどう動いているのか
-2. なぜ EC2 では動いて Fargate では動かないのか
-3. よく紹介される回避策が、なぜ **6 時間後に壊れる**のか
-4. 本リポジトリが採用した解決策と、その選定理由
+2. Cloud SQL Auth Proxy で本当にキーなし認証が使えるのか（公式には SA キーの説明が目立つ）
+3. なぜ EC2 では動いて Fargate では動かないのか
+4. よく紹介される回避策が、なぜ **6 時間後に壊れる**のか
+5. 本リポジトリが採用した解決策と、その選定理由
 
 を順に説明します。
 
@@ -58,7 +59,114 @@ Workload Identity 連携の出発点は、あくまで「**AWS の一時認証�
 
 ---
 
-## 2. EC2 では動く。Fargate では動かない
+## 2. Cloud SQL Auth Proxy で、本当にキーなし認証が使えるのか
+
+ここで多くの人が引っかかります。
+
+> Cloud SQL Auth Proxy の公式ドキュメントには、
+> **サービスアカウントキーを使う方法しか書かれていないように見える。**
+> Workload Identity 連携なんて本当に使えるのか？
+
+もっともな疑問です。実際、[公式の認証オプション](https://docs.cloud.google.com/sql/docs/mysql/connect-auth-proxy)には
+**Workload Identity という言葉が一度も出てきません。** 筆頭に挙がるのは
+`--credentials-file`（＝サービスアカウントキー）です。
+
+**結論から言うと、使えます。** ただしその根拠は、公式ドキュメント上で
+2 つのページに分かれています。
+
+### 根拠 ①: Auth Proxy は ADC を受け付ける
+
+公式の認証オプションは 6 つあり、その **3 番目**がこれです。
+
+| # | 認証方法 |
+| --- | --- |
+| 1 | `--credentials-file`（サービスアカウントキーの JSON ファイル） |
+| 2 | `--token`（OAuth 2.0 アクセストークン） |
+| **3** | **`GOOGLE_APPLICATION_CREDENTIALS` 環境変数で指定した JSON 認証情報ファイル（＝ADC）** |
+| 4 | gcloud CLI の認証済みクライアント |
+| 5 | Compute Engine インスタンスのサービスアカウント |
+| 6 | 実行環境が提供するデフォルトサービスアカウント |
+
+本リポジトリが使っているのは **3 番**です。
+Auth Proxy は認証を自前で実装せず、Go の標準的な認証ライブラリ
+（[`FindDefaultCredentialsWithParams`](https://pkg.go.dev/golang.org/x/oauth2/google#FindDefaultCredentialsWithParams)）に
+**丸ごと委譲しています**。
+
+```mermaid
+flowchart LR
+    A["cloud-sql-proxy"] --> B["cloudsqlconn<br/>(Go コネクタ)"]
+    B --> C["golang.org/x/oauth2/google<br/>FindDefaultCredentialsWithParams"]
+    C --> D["GOOGLE_APPLICATION_CREDENTIALS<br/>が指す JSON を読む"]
+    D --> E1["サービスアカウントキー"]
+    D --> E2["Workload Identity 連携の<br/>認証情報構成ファイル"]
+    D --> E3["gcloud のユーザー認証情報"]
+
+    style E2 fill:#e6ffe6,stroke:#1a8f1a,stroke-width:2px
+    style E1 fill:#ffe0e0,stroke:#d33
+```
+
+### 根拠 ②: ADC が読む JSON は、キーとは限らない
+
+ここが肝です。`GOOGLE_APPLICATION_CREDENTIALS` が指す JSON は
+**サービスアカウントキーだけではありません。**
+認証ライブラリの公式リファレンスに明記されています。
+
+> A JSON file whose path is specified by the `GOOGLE_APPLICATION_CREDENTIALS`
+> environment variable. **For workload identity federation, refer to
+> [how to generate the JSON configuration file] for on-prem/non-Google cloud platforms.**
+>
+> — [`FindDefaultCredentialsWithParams`](https://pkg.go.dev/golang.org/x/oauth2/google#FindDefaultCredentialsWithParams)
+
+> The JSON can represent either a Google Developers Console `client_credentials.json` file,
+> a **Google Developers service account key file**, a gcloud user credentials file, or the
+> **JSON configuration file for workload identity federation in non-Google cloud platforms**.
+>
+> — [`CredentialsFromJSONWithParams`](https://pkg.go.dev/golang.org/x/oauth2/google#CredentialsFromJSONWithParams)
+
+つまり、**同じ `GOOGLE_APPLICATION_CREDENTIALS` という口に、
+キーの代わりに「キーを含まない構成ファイル」を差し込める**わけです。
+
+### 2 つの JSON の違い
+
+同じ環境変数で渡しますが、中身の性質はまったく違います。
+
+| | サービスアカウントキー | Workload Identity 連携の構成ファイル |
+| --- | --- | --- |
+| `type` | `service_account` | `external_account` |
+| 秘密鍵 | **含む**（`private_key`） | **含まない** |
+| 機密性 | 漏洩＝なりすまし成立。厳重に管理が必要 | **非機密**。リポジトリに含めてもよい |
+| 有効期限 | 実質無期限（手動でローテーションが必要） | そもそも鍵が無い |
+| 中身 | 認証情報そのもの | 「外部トークンの取り方」の手順書 |
+
+本リポジトリでは後者を Terraform から生成し、コンテナ起動時に配置しています
+（[`aws_ecs.tf`](../aws_ecs.tf) の `local.adc_config`）。
+**秘密情報を含まないため、Secrets Manager も暗号化も不要**です。
+
+```jsonc
+{
+  "type": "external_account",                    // ← キーではない
+  "audience": "//iam.googleapis.com/projects/…/providers/aws-provider",
+  "subject_token_type": "urn:ietf:params:aws:token-type:aws4_request",
+  "token_url": "https://sts.googleapis.com/v1/token",
+  "service_account_impersonation_url": "https://iamcredentials.googleapis.com/…:generateAccessToken",
+  "credential_source": { /* AWS 認証情報の取得先 */ }
+}
+```
+
+> **なぜ公式ドキュメントに Workload Identity の記述が無いのか**
+>
+> Auth Proxy 側が認証を ADC に丸投げしているためです。Auth Proxy のページは
+> 「ADC を使える」とだけ書き、ADC が何を受け付けるかは認証ドキュメント側の管轄、
+> という分担になっています。**Auth Proxy が非対応なのではありません。**
+
+実際に AWS 上のワークロードから同じ方式（`GOOGLE_APPLICATION_CREDENTIALS` に
+Workload Identity 連携の構成ファイルを指定）で接続している事例は
+[cloud-sql-proxy#1853](https://github.com/GoogleCloudPlatform/cloud-sql-proxy/issues/1853)
+にもあります。
+
+---
+
+## 3. EC2 では動く。Fargate では動かない
 
 GCP の認証ライブラリは、この「AWS の一時認証情報」を
 **EC2 のインスタンスメタデータサービス (IMDS) からしか取得しません。**
@@ -117,7 +225,7 @@ GCP の認証ライブラリはこの差を吸収してくれません。
 
 ---
 
-## 3. NG な方法: 環境変数の上書き（6 時間で壊れる）
+## 4. NG な方法: 環境変数の上書き（6 時間で壊れる）
 
 Web 上でよく見つかる回避策が、これです。
 
@@ -182,7 +290,7 @@ sequenceDiagram
 
 ---
 
-## 4. 解決の方向性は 1 つ: 「毎回取り直す」
+## 5. 解決の方向性は 1 つ: 「毎回取り直す」
 
 原因がはっきりすれば、直し方も明確です。
 **認証情報を固定せず、必要になるたびに ECS のエンドポイントから取り直せばよい。**
@@ -231,7 +339,7 @@ supplier を渡す口が無いのです。
 
 ---
 
-## 5. 採用した解決策: IMDS 互換シム
+## 6. 採用した解決策: IMDS 互換シム
 
 同一タスク内に小さな HTTP サーバー（**IMDS 互換シム**）を置き、
 `127.0.0.1:8169` で **EC2 IMDS と同じ形式**のエンドポイントを公開します。
@@ -362,7 +470,7 @@ ALL CHECKS PASSED
 
 ---
 
-## 6. どの方法を選ぶべきか
+## 7. どの方法を選ぶべきか
 
 ```mermaid
 flowchart TD
@@ -393,8 +501,11 @@ flowchart TD
 
 ---
 
-## 7. まとめ
+## 8. まとめ
 
+- Cloud SQL Auth Proxy の公式ドキュメントに Workload Identity の記述は無いが、
+  認証を **ADC に委譲している**ため使える。`GOOGLE_APPLICATION_CREDENTIALS` が読む JSON は
+  **サービスアカウントキーとは限らず**、秘密鍵を含まない構成ファイルでもよい
 - Workload Identity 連携の出発点は **AWS の一時認証情報**であり、
   GCP の認証ライブラリはそれを **EC2 IMDS からしか取得しない**
 - Fargate に EC2 IMDS は無いため、**公式ドキュメントどおりの設定では動かない**
@@ -412,8 +523,13 @@ flowchart TD
 
 ## 参考
 
+- [Connect using the Cloud SQL Auth Proxy（認証オプション一覧）](https://docs.cloud.google.com/sql/docs/mysql/connect-auth-proxy)
+- [How Application Default Credentials works | Google Cloud](https://docs.cloud.google.com/docs/authentication/application-default-credentials)
+- [`FindDefaultCredentialsWithParams` | golang.org/x/oauth2/google](https://pkg.go.dev/golang.org/x/oauth2/google#FindDefaultCredentialsWithParams)
+- [AIP-4117: External Account Credentials (Workload Identity Federation)](https://google.aip.dev/auth/4117)
 - [Configure Workload Identity Federation with AWS or Azure | Google Cloud](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds)
 - [Cloud SQL: IAM データベース認証](https://docs.cloud.google.com/sql/docs/mysql/iam-authentication)
+- [Connecting to cloud sql instance using WIF credential config file | cloud-sql-proxy#1853](https://github.com/GoogleCloudPlatform/cloud-sql-proxy/issues/1853)
 - [Fargate で Workload Identity を使うベストな方法 | DevelopersIO](https://dev.classmethod.jp/articles/best-way-to-use-fargate-workload-identity/)
 - [auth: support AWS ECS default credentials detection | google-cloud-go#13479](https://github.com/googleapis/google-cloud-go/issues/13479)
 - [Support Workload Identity Federation on AWS ECS/Fargate | google-auth-library-java#1374](https://github.com/googleapis/google-auth-library-java/pull/1374)

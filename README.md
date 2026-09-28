@@ -7,6 +7,12 @@ AWS ECS Fargate 上のコンテナから Google Cloud の Cloud SQL for MySQL �
 - 接続: Cloud SQL Auth Proxy をサイドカーとして同一タスク内で実行
 - DB 認証: IAM データベース認証（`--auto-iam-authn`）によりパスワードも不要
 
+> 💡 **Auth Proxy の公式ドキュメントにはサービスアカウントキーの説明しかないのでは？**
+> — 認証オプションの 3 番目に挙がっている `GOOGLE_APPLICATION_CREDENTIALS`（ADC）を使います。
+> ADC が読む JSON は**キーとは限らず**、Workload Identity 連携の構成ファイル
+> （秘密鍵を含まない非機密のファイル）でも構いません。
+> 根拠は [解説ドキュメントの §2](docs/fargate-workload-identity.md#2-cloud-sql-auth-proxy-で本当にキーなし認証が使えるのか) を参照。
+
 > 📖 **なぜこの構成になっているのか** — Fargate では公式ドキュメントどおりの設定では
 > Workload Identity 連携が動きません。その理由と解決策の比較を図つきで解説しています:
 > **[docs/fargate-workload-identity.md](docs/fargate-workload-identity.md)**
